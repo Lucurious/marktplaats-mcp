@@ -211,16 +211,14 @@ def _explicit_cents(value: Any) -> int | None:
 def _extract_highest_bid(data: Any) -> int | None:
     """Find the current/highest bid in an API or embedded page payload."""
     if isinstance(data, dict):
+        candidates = []
         bids = data.get("bids")
         if isinstance(bids, list):
-            values = [
+            candidates.extend(
                 _explicit_cents(bid.get("value"))
                 for bid in bids
-                if isinstance(bid, dict)
-            ]
-            values = [value for value in values if value is not None]
-            if values:
-                return max(values)
+                if isinstance(bid, dict) and _explicit_cents(bid.get("value")) is not None
+            )
         cents_keys = {
             "highestBidCents", "currentBidCents", "bidAmountCents",
             "highest_bid_cents", "current_bid_cents", "bid_amount_cents",
@@ -233,20 +231,24 @@ def _extract_highest_bid(data: Any) -> int | None:
             if key in cents_keys:
                 amount = _explicit_cents(value)
                 if amount is not None:
-                    return amount
+                    candidates.append(amount)
             if key in amount_keys:
                 amount = _amount_to_cents(value)
                 if amount is not None:
-                    return amount
-        for value in data.values():
-            amount = _extract_highest_bid(value)
-            if amount is not None:
-                return amount
+                    candidates.append(amount)
+        candidates.extend(
+            amount
+            for value in data.values()
+            if (amount := _extract_highest_bid(value)) is not None
+        )
+        return max(candidates) if candidates else None
     elif isinstance(data, list):
-        for value in data:
-            amount = _extract_highest_bid(value)
-            if amount is not None:
-                return amount
+        candidates = [
+            amount
+            for value in data
+            if (amount := _extract_highest_bid(value)) is not None
+        ]
+        return max(candidates) if candidates else None
     elif isinstance(data, str):
         patterns = [
             r"(?:hoogste\s+bod|hoogste\s+bod|highest\s+bid|current\s+bid|huidig\s+bod)\D{0,30}(€\s*[\d. ]+(?:,\d{1,2})?|[\d. ]+(?:,\d{1,2})?)",
@@ -263,13 +265,11 @@ def _extract_highest_bid(data: Any) -> int | None:
 
 def _extract_embedded_bid(data: str) -> int | None:
     """Extract bids from Marktplaats' embedded ``window.__CONFIG__`` JSON."""
-    marker = "window.__CONFIG__ ="
-    start = data.find(marker)
-    if start < 0:
+    match = re.search(r"window\.__CONFIG__\s*=\s*", data)
+    if not match:
         return None
-    start += len(marker)
     try:
-        embedded, _ = json.JSONDecoder().raw_decode(data[start:].lstrip())
+        embedded, _ = json.JSONDecoder().raw_decode(data[match.end():])
     except json.JSONDecodeError:
         return None
     return _extract_highest_bid(embedded)
@@ -280,7 +280,7 @@ def _add_bid_fields(result: dict, bid_cents: int | None, compact: bool = False) 
     if bid_cents is None:
         return
     result["highest_bid_cents"] = bid_cents
-    result["highest_bid"] = bid_cents // 100 if compact else f"€ {bid_cents / 100:,.2f}"
+    result["highest_bid"] = bid_cents / 100 if compact else f"€ {bid_cents / 100:,.2f}"
 
 
 def _detect_seller_type(traits: list[str], seller_name: str = "") -> str:
@@ -759,7 +759,9 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             "url": response.url,
         }
 
-        page_bid_cents = _extract_embedded_bid(response.text) or _extract_highest_bid(response.text)
+        page_bid_cents = _extract_embedded_bid(response.text)
+        if page_bid_cents is None:
+            page_bid_cents = _extract_highest_bid(response.text)
 
         # Extract JSON-LD data
         for script in soup.find_all("script", type="application/ld+json"):
@@ -781,7 +783,9 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
                         for img in images
                     ]
                     result["image_count"] = len(images)
-                    page_bid_cents = _extract_highest_bid(data) or page_bid_cents
+                    embedded_bid = _extract_highest_bid(data)
+                    if embedded_bid is not None:
+                        page_bid_cents = embedded_bid
             except (json.JSONDecodeError, TypeError):
                 pass
 
