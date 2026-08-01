@@ -165,6 +165,124 @@ def _parse_price_type(price_type: str, price_cents: int) -> str:
     return price_map.get(price_type, f"€ {price_cents / 100:,.2f}")
 
 
+def _amount_to_cents(value: Any) -> int | None:
+    """Convert a bid amount represented as cents, euros, or formatted text."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, int):
+        # Marktplaats API amount fields conventionally use cents.
+        return value if value >= 100 else value * 100
+    if isinstance(value, float):
+        return round(value * 100)
+    if not isinstance(value, str):
+        return None
+
+    text = value.strip().replace("€", "").replace("EUR", "").strip()
+    match = re.search(r"\d[\d. ]*(?:[,\.]\d{1,2})?", text)
+    if not match:
+        return None
+    number = match.group(0).replace(" ", "")
+    if "," in number:
+        number = number.replace(".", "").replace(",", ".")
+    elif number.count(".") > 1:
+        number = number.replace(".", "")
+    elif "." in number and len(number.rsplit(".", 1)[1]) == 3:
+        number = number.replace(".", "")
+    try:
+        return round(float(number) * 100)
+    except ValueError:
+        return None
+
+
+def _explicit_cents(value: Any) -> int | None:
+    """Convert a value from a field explicitly expressed in cents."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return round(value)
+    if isinstance(value, str):
+        try:
+            return round(float(value.strip()))
+        except ValueError:
+            return None
+    return None
+
+
+def _extract_highest_bid(data: Any) -> int | None:
+    """Find the current/highest bid in an API or embedded page payload."""
+    if isinstance(data, dict):
+        bids = data.get("bids")
+        if isinstance(bids, list):
+            values = [
+                _explicit_cents(bid.get("value"))
+                for bid in bids
+                if isinstance(bid, dict)
+            ]
+            values = [value for value in values if value is not None]
+            if values:
+                return max(values)
+        cents_keys = {
+            "highestBidCents", "currentBidCents", "bidAmountCents",
+            "highest_bid_cents", "current_bid_cents", "bid_amount_cents",
+        }
+        amount_keys = {
+            "highestBid", "currentBid", "bidAmount", "highest_bid",
+            "current_bid", "bid_amount", "highestOffer", "currentOffer",
+        }
+        for key, value in data.items():
+            if key in cents_keys:
+                amount = _explicit_cents(value)
+                if amount is not None:
+                    return amount
+            if key in amount_keys:
+                amount = _amount_to_cents(value)
+                if amount is not None:
+                    return amount
+        for value in data.values():
+            amount = _extract_highest_bid(value)
+            if amount is not None:
+                return amount
+    elif isinstance(data, list):
+        for value in data:
+            amount = _extract_highest_bid(value)
+            if amount is not None:
+                return amount
+    elif isinstance(data, str):
+        patterns = [
+            r"(?:hoogste\s+bod|hoogste\s+bod|highest\s+bid|current\s+bid|huidig\s+bod)\D{0,30}(€\s*[\d. ]+(?:,\d{1,2})?|[\d. ]+(?:,\d{1,2})?)",
+            r"(?:bieding|bod|bid)\D{0,15}(€\s*[\d. ]+(?:,\d{1,2})?)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, data, re.IGNORECASE)
+            if match:
+                amount = _amount_to_cents(match.group(1))
+                if amount is not None:
+                    return amount
+    return None
+
+
+def _extract_embedded_bid(data: str) -> int | None:
+    """Extract bids from Marktplaats' embedded ``window.__CONFIG__`` JSON."""
+    marker = "window.__CONFIG__ ="
+    start = data.find(marker)
+    if start < 0:
+        return None
+    start += len(marker)
+    try:
+        embedded, _ = json.JSONDecoder().raw_decode(data[start:].lstrip())
+    except json.JSONDecodeError:
+        return None
+    return _extract_highest_bid(embedded)
+
+
+def _add_bid_fields(result: dict, bid_cents: int | None, compact: bool = False) -> None:
+    """Add bid fields to a formatted result when a bid was found."""
+    if bid_cents is None:
+        return
+    result["highest_bid_cents"] = bid_cents
+    result["highest_bid"] = bid_cents // 100 if compact else f"€ {bid_cents / 100:,.2f}"
+
+
 def _detect_seller_type(traits: list[str], seller_name: str = "") -> str:
     """Detect if seller is business or private based on traits and name patterns."""
     trait_set = set(traits)
@@ -351,6 +469,7 @@ def _format_listing(listing: dict, include_specs: bool = False) -> dict:
         "image": first_image,
         "link": original_link,
     }
+    _add_bid_fields(result, _extract_highest_bid(listing))
 
     # Extract specs for electronics
     if include_specs:
@@ -417,6 +536,7 @@ def _format_listing_compact(listing: dict) -> dict:
         "city": location.get("cityName"),
         "seller": "B" if _detect_seller_type(traits, seller_name) == "business" else "P",
     }
+    _add_bid_fields(result, _extract_highest_bid(listing), compact=True)
 
     # Only include optional fields if they have values
     if distance_km is not None:
@@ -639,6 +759,8 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
             "url": response.url,
         }
 
+        page_bid_cents = _extract_embedded_bid(response.text) or _extract_highest_bid(response.text)
+
         # Extract JSON-LD data
         for script in soup.find_all("script", type="application/ld+json"):
             try:
@@ -659,11 +781,13 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
                         for img in images
                     ]
                     result["image_count"] = len(images)
+                    page_bid_cents = _extract_highest_bid(data) or page_bid_cents
             except (json.JSONDecodeError, TypeError):
                 pass
 
         # Extract full description from page text
         text = soup.get_text(separator="|||")
+        _add_bid_fields(result, page_bid_cents)
         if "Beschrijving" in text:
             parts = text.split("|||")
             in_description = False
