@@ -8,10 +8,10 @@ from typing import Any
 
 import requests
 from bs4 import BeautifulSoup
-from mcp.server.fastmcp import FastMCP
+from mcp.server.mcpserver import MCPServer
 
 # Initialize the MCP server
-mcp = FastMCP("marktplaats")
+mcp = MCPServer("marktplaats")
 
 # Constants
 REQUEST_HEADERS = {
